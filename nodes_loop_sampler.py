@@ -1,4 +1,6 @@
+import gc
 import math
+import re
 import torch
 import torch.nn.functional as F
 import logging
@@ -425,7 +427,6 @@ class WanLoopSampler:
             raise ValueError(f"split_step ({split_step}) must be less than total_steps ({total_steps})")
 
         # --- Parse prompt segments (split on 2+ dashes on their own line) ---
-        import re
         segments = [s.strip() for s in re.split(r'\n\s*-{2,}\s*\n', prompt) if s.strip()]
         if not segments:
             raise ValueError("Prompt is empty. Please enter at least one prompt segment.")
@@ -514,6 +515,7 @@ class WanLoopSampler:
 
                 # Free HIGH model before loading LOW
                 del m_high
+                gc.collect()
                 comfy.model_management.cleanup_models()
                 comfy.model_management.soft_empty_cache()
                 comfy.model_management.free_memory(
@@ -562,6 +564,7 @@ class WanLoopSampler:
             if not dry_run:
                 del latent
 
+            gc.collect()
             comfy.model_management.cleanup_models()
             comfy.model_management.soft_empty_cache()
             device = comfy.model_management.get_torch_device()
