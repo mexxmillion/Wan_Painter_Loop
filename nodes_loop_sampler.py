@@ -521,15 +521,12 @@ class WanLoopSampler:
                     start_step=0, last_step=split_step,
                 )
 
-                # Free HIGH model before loading LOW
+                # Purge HIGH model before loading LOW
                 del m_high
+                comfy.model_management.unload_all_models()
                 gc.collect()
-                comfy.model_management.cleanup_models()
                 comfy.model_management.soft_empty_cache()
-                comfy.model_management.free_memory(
-                    comfy.model_management.minimum_inference_memory(), device
-                )
-                print(f"  [{i+1}] HIGH done, freed. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+                print(f"  [{i+1}] HIGH done, purged. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
                 # --- LOW-noise pass: load LoRAs, sample, then free ---
                 low_lora_names = [name for name, _, _ in low_iter_loras] if low_iter_loras else []
@@ -567,19 +564,14 @@ class WanLoopSampler:
                 all_frames.append(images.cpu())
             del images
 
-            # --- Free memory between iterations (mimic ComfyUI's between-node cleanup) ---
+            # --- Purge VRAM between loops (same as original workflow) ---
             del high_pos, high_neg, low_pos, low_neg
             if not dry_run:
                 del latent
 
+            comfy.model_management.unload_all_models()
             gc.collect()
-            comfy.model_management.cleanup_models()
             comfy.model_management.soft_empty_cache()
-            device = comfy.model_management.get_torch_device()
-            comfy.model_management.free_memory(
-                comfy.model_management.minimum_inference_memory(),
-                device,
-            )
             logger.info(f"    Segment {i + 1} done, VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
         # --- Concatenate all frames ---
