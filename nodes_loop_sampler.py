@@ -424,8 +424,9 @@ class WanLoopSampler:
         if split_step >= total_steps:
             raise ValueError(f"split_step ({split_step}) must be less than total_steps ({total_steps})")
 
-        # --- Parse prompt segments (split on --- delimiter) ---
-        segments = [s.strip() for s in prompt.split("---") if s.strip()]
+        # --- Parse prompt segments (split on 2+ dashes on their own line) ---
+        import re
+        segments = [s.strip() for s in re.split(r'\n\s*-{2,}\s*\n', prompt) if s.strip()]
         if not segments:
             raise ValueError("Prompt is empty. Please enter at least one prompt segment.")
         if len(segments) > self.MAX_SEGMENTS:
