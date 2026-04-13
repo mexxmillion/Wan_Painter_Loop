@@ -119,6 +119,21 @@ def _apply_shift(model, shift):
     return m
 
 
+def _apply_loras(model, clip, lora_stack):
+    """Apply LoRA configs [(name, strength_model, strength_clip), ...] to a single model."""
+    if not lora_stack:
+        return model, clip
+
+    for lora_name, strength_model, strength_clip in lora_stack:
+        if strength_model == 0 and strength_clip == 0:
+            continue
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        model, clip = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
+
+    return model, clip
+
+
 def _apply_loras_dual(model_high, model_low, clip, lora_stack):
     """Apply HIGH/LOW LoRA pairs to their respective models.
 
@@ -422,16 +437,18 @@ class WanLoopSampler:
         # --- Take first frame only and resize ---
         current_image = _resize_image(start_image[:1], width, height, mode=resize_mode)
 
-        # --- Apply base LoRAs once (shared across all segments) ---
-        base_high = model_high.clone()
-        base_low = model_low.clone()
-        clip_with_loras = clip
-
+        # --- Pre-split the base lora_stack into HIGH-only and LOW-only lists ---
+        high_base_loras = []
+        low_base_loras = []
         if lora_stack:
-            base_high, base_low, clip_with_loras = _apply_loras_dual(base_high, base_low, clip_with_loras, lora_stack)
+            for high_name, low_name, strength_model, strength_clip in lora_stack:
+                if high_name is not None:
+                    high_base_loras.append((high_name, strength_model, strength_clip))
+                if low_name is not None:
+                    low_base_loras.append((low_name, strength_model, strength_clip))
 
-        # --- Encode negative prompt once (shared) ---
-        neg_cond = _encode_text(clip_with_loras, negative_prompt)
+        # --- Encode prompts with CLIP (before LoRAs, CLIP LoRA effect is minimal for Wan) ---
+        neg_cond = _encode_text(clip, negative_prompt)
 
         all_frames = []
 
@@ -439,21 +456,19 @@ class WanLoopSampler:
             logger.info(f"=== WanLoopSampler: Segment {i + 1}/{len(segments)} ===")
             logger.info(f"    Prompt: {segment_prompt[:80]}{'...' if len(segment_prompt) > 80 else ''}")
 
-            # --- Per-segment LoRAs (clone from base, apply extras on top) ---
+            # --- Pre-split per-segment LoRAs ---
             iter_stack = per_iter_stacks[i] if i < len(per_iter_stacks) else None
+            high_iter_loras = list(high_base_loras)
+            low_iter_loras = list(low_base_loras)
             if iter_stack:
-                m_high, m_low, clip_iter = _apply_loras_dual(
-                    base_high.clone(), base_low.clone(), clip_with_loras, iter_stack
-                )
-                m_high = _apply_shift(m_high, shift)
-                m_low = _apply_shift(m_low, shift)
-            else:
-                m_high = _apply_shift(base_high.clone(), shift)
-                m_low = _apply_shift(base_low.clone(), shift)
-                clip_iter = clip_with_loras
+                for high_name, low_name, strength_model, strength_clip in iter_stack:
+                    if high_name is not None:
+                        high_iter_loras.append((high_name, strength_model, strength_clip))
+                    if low_name is not None:
+                        low_iter_loras.append((low_name, strength_model, strength_clip))
 
             # --- Encode this segment's prompt ---
-            pos_cond = _encode_text(clip_iter, segment_prompt)
+            pos_cond = _encode_text(clip, segment_prompt)
 
             # --- Create I2V conditioning ---
             high_pos, high_neg, low_pos, low_neg, latent = _create_i2v_conditioning(
@@ -465,19 +480,40 @@ class WanLoopSampler:
 
             if dry_run:
                 # --- DRY RUN: skip sampling, create dummy frames ---
-                num_frames = ((length - 1) // 4 + 1) * 4 + 1  # approximate decoded frame count
                 logger.info(f"    DRY RUN: skipping sampling, generating {length} dummy frames")
-                images = current_image.repeat(length, 1, 1, 1)  # repeat start image as dummy
+                images = current_image.repeat(length, 1, 1, 1)
             else:
-                # --- HIGH-noise pass (steps 0 → split_step) ---
                 iter_seed = seed + i
+                device = comfy.model_management.get_torch_device()
+
+                # --- HIGH-noise pass: load LoRAs, sample, then free ---
+                logger.info(f"    HIGH pass: {len(high_iter_loras)} LoRAs, steps 0-{split_step}")
+                m_high = model_high.clone()
+                if high_iter_loras:
+                    m_high, _ = _apply_loras(m_high, clip, high_iter_loras)
+                m_high = _apply_shift(m_high, shift)
+
                 latent = _run_ksampler(
                     m_high, iter_seed, total_steps, cfg, sampler_name, scheduler,
                     high_pos, high_neg, latent,
                     start_step=0, last_step=split_step,
                 )
 
-                # --- LOW-noise pass (steps split_step → total_steps) ---
+                # Free HIGH model before loading LOW
+                del m_high
+                comfy.model_management.cleanup_models()
+                comfy.model_management.soft_empty_cache()
+                comfy.model_management.free_memory(
+                    comfy.model_management.minimum_inference_memory(), device
+                )
+
+                # --- LOW-noise pass: load LoRAs, sample, then free ---
+                logger.info(f"    LOW pass: {len(low_iter_loras)} LoRAs, steps {split_step}-{total_steps}")
+                m_low = model_low.clone()
+                if low_iter_loras:
+                    m_low, _ = _apply_loras(m_low, clip, low_iter_loras)
+                m_low = _apply_shift(m_low, shift)
+
                 latent = _run_ksampler(
                     m_low, iter_seed, total_steps, cfg, sampler_name, scheduler,
                     low_pos, low_neg, latent,
@@ -485,6 +521,8 @@ class WanLoopSampler:
                     start_step=split_step, last_step=total_steps,
                     force_full_denoise=True,
                 )
+
+                del m_low
 
                 # --- VAE decode ---
                 images = vae.decode(latent["samples"])
@@ -505,24 +543,16 @@ class WanLoopSampler:
             del images
 
             # --- Free memory between iterations (mimic ComfyUI's between-node cleanup) ---
-            del m_high, m_low, high_pos, high_neg, low_pos, low_neg
+            del high_pos, high_neg, low_pos, low_neg
             if not dry_run:
                 del latent
-            try:
-                del clip_iter
-            except NameError:
-                pass
 
-            # This is what ComfyUI does between node executions:
-            # 1. cleanup_models removes dead model refs
-            # 2. free_memory checks VRAM and unloads models that aren't needed
             comfy.model_management.cleanup_models()
             comfy.model_management.soft_empty_cache()
             device = comfy.model_management.get_torch_device()
             comfy.model_management.free_memory(
                 comfy.model_management.minimum_inference_memory(),
                 device,
-                keep_loaded=[],  # let it unload everything it wants
             )
             logger.info(f"    Segment {i + 1} done, VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
