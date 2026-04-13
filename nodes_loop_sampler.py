@@ -447,6 +447,14 @@ class WanLoopSampler:
 
         per_iter_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5]
 
+        # --- Purge VRAM before starting — unload everything from previous runs ---
+        device = comfy.model_management.get_torch_device()
+        print(f"  Purging VRAM before start... (free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB)")
+        comfy.model_management.unload_all_models()
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+        print(f"  VRAM after purge: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+
         # --- Take first frame only and resize ---
         current_image = _resize_image(start_image[:1], width, height, mode=resize_mode)
 
