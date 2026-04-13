@@ -342,8 +342,8 @@ def _run_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, ne
 class WanLoopSampler:
     """Wan 2.2 I2V Loop Sampler.
 
-    Type one prompt, or use ``\\\\`` to split into multiple loop segments:
-        ``A woman walks forward \\\\ She turns around \\\\ She waves goodbye``
+    Type one prompt, or use ``---`` to split into multiple loop segments:
+        ``A woman walks forward --- She turns around --- She waves goodbye``
     Each segment generates ~5 seconds of video, chaining the last frame forward.
 
     Steps work like KSamplerAdvanced: ``total_steps`` is the full schedule,
@@ -365,7 +365,7 @@ class WanLoopSampler:
                 "prompt": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "tooltip": "Use \\\\ to split into loop segments. Each segment = one ~5s video generation.",
+                    "tooltip": "Use --- to split into loop segments. Each segment = one ~5s video generation.",
                 }),
                 "negative_prompt": ("STRING", {
                     "default": "",
@@ -407,7 +407,7 @@ class WanLoopSampler:
     CATEGORY = "WanLoop"
     DESCRIPTION = (
         "Wan 2.2 I2V multi-segment loop sampler. "
-        "Use \\\\ in the prompt to split into segments. "
+        "Use --- in the prompt to split into segments. "
         "Each segment chains the last frame into the next, "
         "running a HIGH-noise then LOW-noise pass."
     )
@@ -424,13 +424,24 @@ class WanLoopSampler:
         if split_step >= total_steps:
             raise ValueError(f"split_step ({split_step}) must be less than total_steps ({total_steps})")
 
-        # --- Parse prompt segments ---
-        segments = [s.strip() for s in prompt.split("\\\\") if s.strip()]
+        # --- Parse prompt segments (split on --- delimiter) ---
+        segments = [s.strip() for s in prompt.split("---") if s.strip()]
         if not segments:
             raise ValueError("Prompt is empty. Please enter at least one prompt segment.")
         if len(segments) > self.MAX_SEGMENTS:
             logger.warning(f"Prompt has {len(segments)} segments, capping at {self.MAX_SEGMENTS}")
             segments = segments[: self.MAX_SEGMENTS]
+
+        # --- Log the execution plan ---
+        print(f"\n{'='*60}")
+        print(f"WanLoopSampler: {len(segments)} segment(s) detected")
+        print(f"  total_steps={total_steps}, split_step={split_step}")
+        print(f"  resolution={width}x{height}, length={length}, cfg={cfg}")
+        print(f"  shift={shift}, motion_amplitude={motion_amplitude}")
+        print(f"  sampler={sampler_name}, scheduler={scheduler}")
+        for j, seg in enumerate(segments):
+            print(f"  Segment {j+1}: \"{seg[:100]}{'...' if len(seg)>100 else ''}\"")
+        print(f"{'='*60}\n")
 
         per_iter_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5]
 
@@ -487,7 +498,8 @@ class WanLoopSampler:
                 device = comfy.model_management.get_torch_device()
 
                 # --- HIGH-noise pass: load LoRAs, sample, then free ---
-                logger.info(f"    HIGH pass: {len(high_iter_loras)} LoRAs, steps 0-{split_step}")
+                high_lora_names = [name for name, _, _ in high_iter_loras] if high_iter_loras else []
+                print(f"  [{i+1}] HIGH pass: steps 0→{split_step}, seed={iter_seed}, LoRAs={high_lora_names}")
                 m_high = model_high.clone()
                 if high_iter_loras:
                     m_high, _ = _apply_loras(m_high, clip, high_iter_loras)
@@ -506,9 +518,11 @@ class WanLoopSampler:
                 comfy.model_management.free_memory(
                     comfy.model_management.minimum_inference_memory(), device
                 )
+                print(f"  [{i+1}] HIGH done, freed. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
                 # --- LOW-noise pass: load LoRAs, sample, then free ---
-                logger.info(f"    LOW pass: {len(low_iter_loras)} LoRAs, steps {split_step}-{total_steps}")
+                low_lora_names = [name for name, _, _ in low_iter_loras] if low_iter_loras else []
+                print(f"  [{i+1}] LOW pass: steps {split_step}→{total_steps}, seed={iter_seed}, LoRAs={low_lora_names}")
                 m_low = model_low.clone()
                 if low_iter_loras:
                     m_low, _ = _apply_loras(m_low, clip, low_iter_loras)
