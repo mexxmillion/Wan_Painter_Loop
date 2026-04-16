@@ -7,17 +7,20 @@
 from .nodes_loop_sampler import WanLoopSampler
 from .nodes_lora_stack import WanLoopLoraStack
 from .nodes_resolution import WanLoopResolution
+from .nodes_purge_vram import WanLoopPurgeVRAM
 
 NODE_CLASS_MAPPINGS = {
     "WanLoopSampler": WanLoopSampler,
     "WanLoopLoraStack": WanLoopLoraStack,
     "WanLoopResolution": WanLoopResolution,
+    "WanLoopPurgeVRAM": WanLoopPurgeVRAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanLoopSampler": "Wan I2V Loop Sampler",
     "WanLoopLoraStack": "Wan Loop LoRA Stack",
     "WanLoopResolution": "Wan Loop Resolution",
+    "WanLoopPurgeVRAM": "Purge VRAM",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
