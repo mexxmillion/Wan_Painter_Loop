@@ -1,9 +1,13 @@
 import gc
 import math
+import os
 import re
 import torch
 import torch.nn.functional as F
 import logging
+
+import numpy as np
+from PIL import Image
 
 import comfy.model_management
 import comfy.model_sampling
@@ -160,6 +164,37 @@ def _apply_loras_dual(model_high, model_low, clip, lora_stack):
             model_low, clip = comfy.sd.load_lora_for_models(model_low, clip, lora, strength_model, strength_clip)
 
     return model_high, model_low, clip
+
+
+def _save_segment_video(images, segment_index, output_dir, fps=16):
+    """Save a segment's frames as an animated WEBP to output_dir.
+
+    Args:
+        images: tensor [F, H, W, C] in 0-1 range
+        segment_index: 1-based segment number
+        output_dir: folder to write into
+        fps: frames per second
+    """
+    frames = []
+    for f in range(images.shape[0]):
+        arr = (images[f].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        frames.append(Image.fromarray(arr))
+
+    if not frames:
+        return None
+
+    filename = f"wanloop_seg{segment_index:02d}.webp"
+    filepath = os.path.join(output_dir, filename)
+    duration = int(1000 / fps)  # ms per frame
+    frames[0].save(
+        filepath,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        loop=0,
+        quality=80,
+    )
+    return filepath
 
 
 def _encode_text(clip, text):
@@ -392,6 +427,10 @@ class WanLoopSampler:
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
                 "dry_run": ("BOOLEAN", {"default": False,
                                         "tooltip": "Test mode: skips sampling, returns dummy frames. Use to verify wiring and LoRA loading without waiting."}),
+                "save_intermediates": ("BOOLEAN", {"default": False,
+                                                   "tooltip": "Save each segment as a separate WEBP video in the output folder as soon as it finishes decoding."}),
+                "purge_vram": ("BOOLEAN", {"default": True,
+                                           "tooltip": "Purge VRAM between passes/segments. Disable on 48GB+ GPUs with --highvram to keep models resident and avoid reload overhead."}),
             },
             "optional": {
                 "lora_stack": ("LORA_STACK", {"tooltip": "Base LoRAs applied to ALL segments"}),
@@ -418,6 +457,8 @@ class WanLoopSampler:
                  prompt, negative_prompt, width, height, length, seed,
                  total_steps, split_step, cfg, shift, motion_amplitude,
                  resize_mode, sampler_name, scheduler, dry_run=False,
+                 save_intermediates=False,
+                 purge_vram=True,
                  lora_stack=None,
                  lora_stack_1=None, lora_stack_2=None, lora_stack_3=None,
                  lora_stack_4=None, lora_stack_5=None):
@@ -447,13 +488,16 @@ class WanLoopSampler:
 
         per_iter_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5]
 
-        # --- Purge VRAM before starting — unload everything from previous runs ---
+        # --- Optionally purge VRAM before starting ---
         device = comfy.model_management.get_torch_device()
-        print(f"  Purging VRAM before start... (free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB)")
-        comfy.model_management.unload_all_models()
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
-        print(f"  VRAM after purge: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+        if purge_vram:
+            print(f"  Purging VRAM before start... (free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB)")
+            comfy.model_management.unload_all_models()
+            gc.collect()
+            comfy.model_management.soft_empty_cache()
+            print(f"  VRAM after purge: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+        else:
+            print(f"  Skipping VRAM purge (purge_vram=False, free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB)")
 
         # --- Take first frame only and resize ---
         current_image = _resize_image(start_image[:1], width, height, mode=resize_mode)
@@ -521,12 +565,15 @@ class WanLoopSampler:
                     start_step=0, last_step=split_step,
                 )
 
-                # Purge HIGH model before loading LOW
+                # Purge HIGH model before loading LOW (skip if enough VRAM)
                 del m_high
-                comfy.model_management.unload_all_models()
-                gc.collect()
-                comfy.model_management.soft_empty_cache()
-                print(f"  [{i+1}] HIGH done, purged. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+                if purge_vram:
+                    comfy.model_management.unload_all_models()
+                    gc.collect()
+                    comfy.model_management.soft_empty_cache()
+                    print(f"  [{i+1}] HIGH done, purged. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+                else:
+                    print(f"  [{i+1}] HIGH done (no purge). VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
                 # --- LOW-noise pass: load LoRAs, sample, then free ---
                 low_lora_names = [name for name, _, _ in low_iter_loras] if low_iter_loras else []
@@ -553,6 +600,14 @@ class WanLoopSampler:
                 while images.ndim > 4:
                     images = images.squeeze(0)
 
+            # --- Save intermediate segment video if requested ---
+            if save_intermediates:
+                output_dir = folder_paths.get_output_directory()
+                seg_path = _save_segment_video(images, i + 1, output_dir)
+                if seg_path:
+                    logger.info(f"    Saved intermediate: {seg_path}")
+                    print(f"  [{i+1}] Intermediate saved: {seg_path}")
+
             # --- Extract last frame for next iteration (keep on CPU to save VRAM) ---
             current_image = images[-1:].cpu()
 
@@ -564,14 +619,15 @@ class WanLoopSampler:
                 all_frames.append(images.cpu())
             del images
 
-            # --- Purge VRAM between loops (same as original workflow) ---
+            # --- Optionally purge VRAM between loops ---
             del high_pos, high_neg, low_pos, low_neg
             if not dry_run:
                 del latent
 
-            comfy.model_management.unload_all_models()
-            gc.collect()
-            comfy.model_management.soft_empty_cache()
+            if purge_vram:
+                comfy.model_management.unload_all_models()
+                gc.collect()
+                comfy.model_management.soft_empty_cache()
             logger.info(f"    Segment {i + 1} done, VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
         # --- Concatenate all frames ---

@@ -1397,8 +1397,12 @@
         1,
         5,
         1.5,
+        "crop (center)",
         "euler",
-        "simple"
+        "simple",
+        false,
+        false,
+        true
       ],
       "color": "#322",
       "bgcolor": "#533"
