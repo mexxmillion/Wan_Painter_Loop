@@ -5,6 +5,7 @@ import re
 import torch
 import torch.nn.functional as F
 import logging
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image
@@ -22,6 +23,36 @@ import node_helpers
 logger = logging.getLogger("WanLoopSampler")
 
 RESIZE_MODES = ["stretch", "crop (center)", "crop (top)", "crop (bottom)", "pad (black)", "pad (edge)", "resize (fit)"]
+I2V_MODES = ["Painter I2V", "Regular I2V"]
+
+# ---------------------------------------------------------------------------
+# LoRA caches — module-level, persist across runs
+# ---------------------------------------------------------------------------
+# Avoids reloading LoRA files from disk on every run.
+_lora_file_cache: dict = {}          # path -> raw lora tensor dict (CPU)
+
+# Avoids re-patching the model when the same LoRAs + same base model are used.
+# Key: (id(model.model), config_tuple)  Value: patched ModelPatcher
+# OrderedDict gives us FIFO eviction — oldest entry goes first.
+_patched_model_cache: OrderedDict = OrderedDict()
+_MAX_PATCH_CACHE = 8                 # 4 model slots × 2 (high/low) = safe for most setups
+
+
+def _lora_stack_key(lora_stack):
+    """Stable, hashable key for a LoRA stack list."""
+    if not lora_stack:
+        return ()
+    return tuple(
+        (name, round(float(sm), 6), round(float(sc), 6))
+        for name, sm, sc in lora_stack
+    )
+
+
+def clear_lora_cache():
+    """Flush both LoRA caches. Call after changing LoRA files on disk."""
+    _lora_file_cache.clear()
+    _patched_model_cache.clear()
+    logger.info("[LoRA cache] Cleared file cache and patch cache.")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,19 +156,59 @@ def _apply_shift(model, shift):
     return m
 
 
-def _apply_loras(model, clip, lora_stack):
-    """Apply LoRA configs [(name, strength_model, strength_clip), ...] to a single model."""
+def _apply_loras(model, lora_stack):
+    """Apply LoRA configs [(name, strength_model, strength_clip), ...] to a single model.
+
+    Uses a two-level cache:
+      1. File cache  — raw LoRA tensors, avoids repeated disk reads.
+      2. Patch cache — fully-patched ModelPatcher keyed by (base model id, lora config).
+                       On a cache hit the patched patcher is cloned and returned
+                       immediately, skipping both disk I/O and patch computation.
+
+    Cache is module-level and persists across ComfyUI runs within the same session.
+    Call clear_lora_cache() if you replace a LoRA file on disk mid-session.
+    """
     if not lora_stack:
-        return model, clip
+        return model
 
-    for lora_name, strength_model, strength_clip in lora_stack:
-        if strength_model == 0 and strength_clip == 0:
-            continue
+    # Filter zero-strength entries so they don't affect the cache key
+    active = [(n, sm, sc) for n, sm, sc in lora_stack if sm != 0 or sc != 0]
+    if not active:
+        return model
+
+    config_key = _lora_stack_key(active)
+    model_id   = id(model.model)      # shared across clones of the same base model
+    cache_key  = (model_id, config_key)
+
+    if cache_key in _patched_model_cache:
+        # Move to end so it's the last to be evicted
+        _patched_model_cache.move_to_end(cache_key)
+        lora_names = [n for n, _, _ in active]
+        logger.info(f"    [LoRA cache] Patch hit — skipping disk+patch for {lora_names}")
+        return _patched_model_cache[cache_key].clone()
+
+    # Build patched model from scratch
+    result = model.clone()
+    for lora_name, strength_model, _strength_clip in active:
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        model, clip = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
 
-    return model, clip
+        if lora_path not in _lora_file_cache:
+            logger.info(f"    [LoRA cache] Loading from disk: {lora_name}")
+            _lora_file_cache[lora_path] = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        else:
+            logger.info(f"    [LoRA cache] File hit: {lora_name}")
+
+        result, _ = comfy.sd.load_lora_for_models(result, None, _lora_file_cache[lora_path], strength_model, 0)
+
+    # Store in patch cache, evict oldest if full
+    if len(_patched_model_cache) >= _MAX_PATCH_CACHE:
+        evicted = next(iter(_patched_model_cache))
+        del _patched_model_cache[evicted]
+        logger.info(f"    [LoRA cache] Evicted oldest patch cache entry (cache full at {_MAX_PATCH_CACHE})")
+
+    _patched_model_cache[cache_key] = result
+    logger.info(f"    [LoRA cache] Cached patched model for {[n for n,_,_ in active]}")
+    return result.clone()
 
 
 def _apply_loras_dual(model_high, model_low, clip, lora_stack):
@@ -145,6 +216,7 @@ def _apply_loras_dual(model_high, model_low, clip, lora_stack):
 
     lora_stack format: [(high_name, low_name, strength_model, strength_clip), ...]
     Either high or low can be None to skip that model.
+    Uses the same file cache as _apply_loras to avoid redundant disk reads.
     """
     if not lora_stack:
         return model_high, model_low, clip
@@ -155,13 +227,15 @@ def _apply_loras_dual(model_high, model_low, clip, lora_stack):
 
         if high_name is not None:
             lora_path = folder_paths.get_full_path_or_raise("loras", high_name)
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            model_high, clip = comfy.sd.load_lora_for_models(model_high, clip, lora, strength_model, strength_clip)
+            if lora_path not in _lora_file_cache:
+                _lora_file_cache[lora_path] = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            model_high, clip = comfy.sd.load_lora_for_models(model_high, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
 
         if low_name is not None:
             lora_path = folder_paths.get_full_path_or_raise("loras", low_name)
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            model_low, clip = comfy.sd.load_lora_for_models(model_low, clip, lora, strength_model, strength_clip)
+            if lora_path not in _lora_file_cache:
+                _lora_file_cache[lora_path] = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            model_low, clip = comfy.sd.load_lora_for_models(model_low, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
 
     return model_high, model_low, clip
 
@@ -206,8 +280,14 @@ def _encode_text(clip, text):
 
 def _create_i2v_conditioning(positive, negative, vae, start_image, width, height, length,
                               batch_size, motion_amplitude, resize_mode="crop (center)",
-                              color_protect=True, correct_strength=0.01):
-    """Port of PainterI2VAdvanced conditioning logic.
+                              color_protect=True, correct_strength=0.01,
+                              mode="Painter I2V"):
+    """Conditioning builder for Wan 2.2 I2V loop.
+
+    mode="Painter I2V" (default): motion-enhanced concat for HIGH, original for LOW,
+        plus reference_latents (port of PainterI2VAdvanced).
+    mode="Regular I2V": stock WanImageToVideo behavior — same concat for HIGH and LOW,
+        no motion scaling, no color protect, no reference_latents.
 
     Returns: (high_positive, high_negative, low_positive, low_negative, latent_dict)
     """
@@ -245,6 +325,20 @@ def _create_i2v_conditioning(positive, negative, vae, start_image, width, height
         mask[:, :, 0] = 0.0
 
         concat_latent_image_original = concat_latent_image.clone()
+
+        if mode == "Regular I2V":
+            # Stock WanImageToVideo: both HIGH and LOW get the same basic concat,
+            # no motion scaling, no reference_latents.
+            positive = node_helpers.conditioning_set_values(
+                positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+            )
+            positive_original = positive
+            negative_original = negative
+            out_latent = {"samples": latent}
+            return positive, negative, positive_original, negative_original, out_latent
 
         if motion_amplitude > 1.0:
             base_latent = concat_latent_image[:, :, 0:1]
@@ -433,6 +527,8 @@ class WanLoopSampler:
                                            "tooltip": "Purge VRAM between passes/segments. Disable on 48GB+ GPUs with --highvram to keep models resident and avoid reload overhead."}),
             },
             "optional": {
+                "i2v_mode": (I2V_MODES, {"default": "Painter I2V",
+                                          "tooltip": "Painter I2V (default, original behavior): motion-enhanced latent + reference_latents. Regular I2V: stock WanImageToVideo conditioning (no motion scaling, no refs). Safe to leave unset on old workflows — defaults to Painter I2V."}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "Base LoRAs applied to ALL segments"}),
                 "lora_stack_1": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 1 (on top of base)"}),
                 "lora_stack_2": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 2 (on top of base)"}),
@@ -459,6 +555,7 @@ class WanLoopSampler:
                  resize_mode, sampler_name, scheduler, dry_run=False,
                  save_intermediates=False,
                  purge_vram=True,
+                 i2v_mode="Painter I2V",
                  lora_stack=None,
                  lora_stack_1=None, lora_stack_2=None, lora_stack_3=None,
                  lora_stack_4=None, lora_stack_5=None):
@@ -480,7 +577,7 @@ class WanLoopSampler:
         print(f"WanLoopSampler: {len(segments)} segment(s) detected")
         print(f"  total_steps={total_steps}, split_step={split_step}")
         print(f"  resolution={width}x{height}, length={length}, cfg={cfg}")
-        print(f"  shift={shift}, motion_amplitude={motion_amplitude}")
+        print(f"  i2v_mode={i2v_mode}, shift={shift}, motion_amplitude={motion_amplitude}")
         print(f"  sampler={sampler_name}, scheduler={scheduler}")
         for j, seg in enumerate(segments):
             print(f"  Segment {j+1}: \"{seg[:100]}{'...' if len(seg)>100 else ''}\"")
@@ -521,113 +618,141 @@ class WanLoopSampler:
             logger.info(f"=== WanLoopSampler: Segment {i + 1}/{len(segments)} ===")
             logger.info(f"    Prompt: {segment_prompt[:80]}{'...' if len(segment_prompt) > 80 else ''}")
 
-            # --- Pre-split per-segment LoRAs ---
-            iter_stack = per_iter_stacks[i] if i < len(per_iter_stacks) else None
-            high_iter_loras = list(high_base_loras)
-            low_iter_loras = list(low_base_loras)
-            if iter_stack:
-                for high_name, low_name, strength_model, strength_clip in iter_stack:
-                    if high_name is not None:
-                        high_iter_loras.append((high_name, strength_model, strength_clip))
-                    if low_name is not None:
-                        low_iter_loras.append((low_name, strength_model, strength_clip))
+            m_high = None
+            m_low = None
+            pos_cond = None
+            high_pos = high_neg = low_pos = low_neg = None
+            latent = None
+            images = None
+            segment_completed = False
 
-            # --- Encode this segment's prompt ---
-            pos_cond = _encode_text(clip, segment_prompt)
+            try:
+                # --- Pre-split per-segment LoRAs ---
+                iter_stack = per_iter_stacks[i] if i < len(per_iter_stacks) else None
+                high_iter_loras = list(high_base_loras)
+                low_iter_loras = list(low_base_loras)
+                if iter_stack:
+                    for high_name, low_name, strength_model, strength_clip in iter_stack:
+                        if high_name is not None:
+                            high_iter_loras.append((high_name, strength_model, strength_clip))
+                        if low_name is not None:
+                            low_iter_loras.append((low_name, strength_model, strength_clip))
 
-            # --- Create I2V conditioning ---
-            high_pos, high_neg, low_pos, low_neg, latent = _create_i2v_conditioning(
-                pos_cond, neg_cond, vae, current_image,
-                width, height, length, batch_size=1,
-                motion_amplitude=motion_amplitude,
-                resize_mode=resize_mode,
-            )
+                # --- Encode this segment's prompt ---
+                pos_cond = _encode_text(clip, segment_prompt)
 
-            if dry_run:
-                # --- DRY RUN: skip sampling, create dummy frames ---
-                logger.info(f"    DRY RUN: skipping sampling, generating {length} dummy frames")
-                images = current_image.repeat(length, 1, 1, 1)
-            else:
-                iter_seed = seed + i
-                device = comfy.model_management.get_torch_device()
-
-                # --- HIGH-noise pass: load LoRAs, sample, then free ---
-                high_lora_names = [name for name, _, _ in high_iter_loras] if high_iter_loras else []
-                print(f"  [{i+1}] HIGH pass: steps 0→{split_step}, seed={iter_seed}, LoRAs={high_lora_names}")
-                m_high = model_high.clone()
-                if high_iter_loras:
-                    m_high, _ = _apply_loras(m_high, clip, high_iter_loras)
-                m_high = _apply_shift(m_high, shift)
-
-                latent = _run_ksampler(
-                    m_high, iter_seed, total_steps, cfg, sampler_name, scheduler,
-                    high_pos, high_neg, latent,
-                    start_step=0, last_step=split_step,
+                # --- Create I2V conditioning ---
+                high_pos, high_neg, low_pos, low_neg, latent = _create_i2v_conditioning(
+                    pos_cond, neg_cond, vae, current_image,
+                    width, height, length, batch_size=1,
+                    motion_amplitude=motion_amplitude,
+                    resize_mode=resize_mode,
+                    mode=i2v_mode,
                 )
 
-                # Purge HIGH model before loading LOW (skip if enough VRAM)
-                del m_high
-                if purge_vram:
+                if dry_run:
+                    # --- DRY RUN: skip sampling, create dummy frames ---
+                    logger.info(f"    DRY RUN: skipping sampling, generating {length} dummy frames")
+                    images = current_image.repeat(length, 1, 1, 1)
+                else:
+                    iter_seed = seed + i
+                    device = comfy.model_management.get_torch_device()
+
+                    # --- HIGH-noise pass: load LoRAs, sample, then free ---
+                    high_lora_names = [name for name, _, _ in high_iter_loras] if high_iter_loras else []
+                    print(f"  [{i+1}] HIGH pass: steps 0→{split_step}, seed={iter_seed}, LoRAs={high_lora_names}")
+                    m_high = model_high.clone()
+                    if high_iter_loras:
+                        m_high = _apply_loras(m_high, high_iter_loras)
+                    m_high = _apply_shift(m_high, shift)
+
+                    latent = _run_ksampler(
+                        m_high, iter_seed, total_steps, cfg, sampler_name, scheduler,
+                        high_pos, high_neg, latent,
+                        start_step=0, last_step=split_step,
+                    )
+
+                    # Purge HIGH model before loading LOW (skip if enough VRAM)
+                    del m_high
+                    m_high = None
+                    if purge_vram:
+                        comfy.model_management.unload_all_models()
+                        gc.collect()
+                        comfy.model_management.soft_empty_cache()
+                        print(f"  [{i+1}] HIGH done, purged. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+                    else:
+                        print(f"  [{i+1}] HIGH done (no purge). VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
+
+                    # --- LOW-noise pass: load LoRAs, sample, then free ---
+                    low_lora_names = [name for name, _, _ in low_iter_loras] if low_iter_loras else []
+                    print(f"  [{i+1}] LOW pass: steps {split_step}→{total_steps}, seed={iter_seed}, LoRAs={low_lora_names}")
+                    m_low = model_low.clone()
+                    if low_iter_loras:
+                        m_low = _apply_loras(m_low, low_iter_loras)
+                    m_low = _apply_shift(m_low, shift)
+
+                    latent = _run_ksampler(
+                        m_low, iter_seed, total_steps, cfg, sampler_name, scheduler,
+                        low_pos, low_neg, latent,
+                        disable_noise=True,
+                        start_step=split_step, last_step=total_steps,
+                        force_full_denoise=True,
+                    )
+
+                    del m_low
+                    m_low = None
+
+                    # --- VAE decode ---
+                    images = vae.decode(latent["samples"])
+
+                    # Ensure 4D [F, H, W, C] — Wan VAE may return 5D
+                    while images.ndim > 4:
+                        images = images.squeeze(0)
+
+                # --- Save intermediate segment video if requested ---
+                if save_intermediates:
+                    output_dir = folder_paths.get_output_directory()
+                    seg_path = _save_segment_video(images, i + 1, output_dir)
+                    if seg_path:
+                        logger.info(f"    Saved intermediate: {seg_path}")
+                        print(f"  [{i+1}] Intermediate saved: {seg_path}")
+
+                # --- Extract last frame for next iteration (keep on CPU to save VRAM) ---
+                current_image = images[-1:].cpu()
+
+                # --- Collect frames (skip first on subsequent iterations to avoid duplicate) ---
+                # Move to CPU immediately to free GPU VRAM for next segment
+                if i > 0:
+                    all_frames.append(images[1:].cpu())
+                else:
+                    all_frames.append(images.cpu())
+
+                segment_completed = True
+            finally:
+                if images is not None:
+                    del images
+                if latent is not None:
+                    del latent
+                if m_high is not None:
+                    del m_high
+                if m_low is not None:
+                    del m_low
+                if high_pos is not None:
+                    del high_pos
+                if high_neg is not None:
+                    del high_neg
+                if low_pos is not None:
+                    del low_pos
+                if low_neg is not None:
+                    del low_neg
+                if pos_cond is not None:
+                    del pos_cond
+
+                if purge_vram or not segment_completed:
                     comfy.model_management.unload_all_models()
                     gc.collect()
                     comfy.model_management.soft_empty_cache()
-                    print(f"  [{i+1}] HIGH done, purged. VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
-                else:
-                    print(f"  [{i+1}] HIGH done (no purge). VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
-                # --- LOW-noise pass: load LoRAs, sample, then free ---
-                low_lora_names = [name for name, _, _ in low_iter_loras] if low_iter_loras else []
-                print(f"  [{i+1}] LOW pass: steps {split_step}→{total_steps}, seed={iter_seed}, LoRAs={low_lora_names}")
-                m_low = model_low.clone()
-                if low_iter_loras:
-                    m_low, _ = _apply_loras(m_low, clip, low_iter_loras)
-                m_low = _apply_shift(m_low, shift)
-
-                latent = _run_ksampler(
-                    m_low, iter_seed, total_steps, cfg, sampler_name, scheduler,
-                    low_pos, low_neg, latent,
-                    disable_noise=True,
-                    start_step=split_step, last_step=total_steps,
-                    force_full_denoise=True,
-                )
-
-                del m_low
-
-                # --- VAE decode ---
-                images = vae.decode(latent["samples"])
-
-                # Ensure 4D [F, H, W, C] — Wan VAE may return 5D
-                while images.ndim > 4:
-                    images = images.squeeze(0)
-
-            # --- Save intermediate segment video if requested ---
-            if save_intermediates:
-                output_dir = folder_paths.get_output_directory()
-                seg_path = _save_segment_video(images, i + 1, output_dir)
-                if seg_path:
-                    logger.info(f"    Saved intermediate: {seg_path}")
-                    print(f"  [{i+1}] Intermediate saved: {seg_path}")
-
-            # --- Extract last frame for next iteration (keep on CPU to save VRAM) ---
-            current_image = images[-1:].cpu()
-
-            # --- Collect frames (skip first on subsequent iterations to avoid duplicate) ---
-            # Move to CPU immediately to free GPU VRAM for next segment
-            if i > 0:
-                all_frames.append(images[1:].cpu())
-            else:
-                all_frames.append(images.cpu())
-            del images
-
-            # --- Optionally purge VRAM between loops ---
-            del high_pos, high_neg, low_pos, low_neg
-            if not dry_run:
-                del latent
-
-            if purge_vram:
-                comfy.model_management.unload_all_models()
-                gc.collect()
-                comfy.model_management.soft_empty_cache()
             logger.info(f"    Segment {i + 1} done, VRAM free: {comfy.model_management.get_free_memory(device) / (1024**2):.0f}MB")
 
         # --- Concatenate all frames ---

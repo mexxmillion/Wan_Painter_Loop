@@ -1,6 +1,37 @@
 import gc
 import torch
 import comfy.model_management
+from .nodes_loop_sampler import clear_lora_cache
+
+
+class WanLoopClearLoraCache:
+    """Clear the WanLoopSampler LoRA cache.
+
+    The sampler caches loaded LoRA files and patched models in RAM across runs.
+    Use this node if you replace a LoRA file on disk mid-session, or to free
+    the CPU RAM used by cached patches.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "anything": ("*", {"tooltip": "Pass any connection through to trigger before downstream nodes"}),
+            },
+        }
+
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("passthrough",)
+    FUNCTION = "clear"
+    CATEGORY = "WanLoop"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Flush the WanLoopSampler LoRA file + patch cache. Use if you updated a LoRA file on disk."
+
+    def clear(self, anything=None):
+        clear_lora_cache()
+        print("  [WanLoop] LoRA cache cleared.")
+        return (anything,)
 
 
 class WanLoopPurgeVRAM:

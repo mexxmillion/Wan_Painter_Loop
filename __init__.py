@@ -7,13 +7,14 @@
 from .nodes_loop_sampler import WanLoopSampler
 from .nodes_lora_stack import WanLoopLoraStack
 from .nodes_resolution import WanLoopResolution
-from .nodes_purge_vram import WanLoopPurgeVRAM
+from .nodes_purge_vram import WanLoopPurgeVRAM, WanLoopClearLoraCache
 
 NODE_CLASS_MAPPINGS = {
     "WanLoopSampler": WanLoopSampler,
     "WanLoopLoraStack": WanLoopLoraStack,
     "WanLoopResolution": WanLoopResolution,
     "WanLoopPurgeVRAM": WanLoopPurgeVRAM,
+    "WanLoopClearLoraCache": WanLoopClearLoraCache,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -21,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanLoopLoraStack": "Wan Loop LoRA Stack",
     "WanLoopResolution": "Wan Loop Resolution",
     "WanLoopPurgeVRAM": "Purge VRAM",
+    "WanLoopClearLoraCache": "Clear LoRA Cache",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
