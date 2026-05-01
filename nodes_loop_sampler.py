@@ -2,6 +2,7 @@ import gc
 import math
 import os
 import re
+import types
 import torch
 import torch.nn.functional as F
 import logging
@@ -10,6 +11,7 @@ from collections import OrderedDict
 import numpy as np
 from PIL import Image
 
+import comfy.ldm.modules.attention
 import comfy.model_management
 import comfy.model_sampling
 import comfy.sample
@@ -53,6 +55,33 @@ def clear_lora_cache():
     _lora_file_cache.clear()
     _patched_model_cache.clear()
     logger.info("[LoRA cache] Cleared file cache and patch cache.")
+
+
+# ---------------------------------------------------------------------------
+# Log filter: silence "lora key not loaded" spam from ComfyUI's lora loader.
+# Those warnings fire when a LoRA file contains keys for layers that don't exist
+# in the current model architecture (e.g. Wan 2.1 I2V img-cross-attn keys in a
+# Wan 2.2 I2V LoRA). They're harmless — matching keys still patch correctly.
+# ---------------------------------------------------------------------------
+class _LoraKeyNotLoadedFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if msg.startswith("lora key not loaded"):
+            return False
+        return True
+
+
+_lora_key_filter = _LoraKeyNotLoadedFilter()
+
+
+class _SuppressLoraKeyWarnings:
+    """Context manager that adds the filter to the root logger and removes it on exit."""
+    def __enter__(self):
+        logging.getLogger().addFilter(_lora_key_filter)
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        logging.getLogger().removeFilter(_lora_key_filter)
+        return False
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,6 +185,164 @@ def _apply_shift(model, shift):
     return m
 
 
+# ---------------------------------------------------------------------------
+# CFGZeroStar (https://github.com/WeichenFan/CFG-Zero-star)
+# ---------------------------------------------------------------------------
+
+def _apply_cfg_zero_star(model):
+    """Patch model with CFGZeroStar post-CFG correction."""
+    m = model.clone()
+    def cfg_zero_star(args):
+        positive_flat = (args['input'] - args['cond_denoised']).reshape(args['input'].shape[0], -1)
+        negative_flat = (args['input'] - args['uncond_denoised']).reshape(args['input'].shape[0], -1)
+        dot = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+        sq_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+        alpha = (dot / sq_norm).reshape([args['input'].shape[0]] + [1] * (args['input'].ndim - 1))
+        uncond_p = args['uncond_denoised']
+        return args["denoised"] + uncond_p * (alpha - 1.0) + args['cond_scale'] * uncond_p * (1.0 - alpha)
+    m.set_model_sampler_post_cfg_function(cfg_zero_star)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# NAG — Normalized Attention Guidance (https://github.com/ChenDarYen/Normalized-Attention-Guidance)
+# Ported from KJNodes WanVideoNAG. Inlined to avoid hard dependency on KJNodes.
+# ---------------------------------------------------------------------------
+
+def _nag_core(self, query, context_positive, context_negative, transformer_options={}):
+    """Compute normalized attention guidance for one branch."""
+    k_pos = self.norm_k(self.k(context_positive))
+    v_pos = self.v(context_positive)
+    k_neg = self.norm_k(self.k(context_negative))
+    v_neg = self.v(context_negative)
+    try:
+        x_pos = comfy.ldm.modules.attention.optimized_attention(query, k_pos, v_pos, heads=self.num_heads, transformer_options=transformer_options).flatten(2)
+        x_neg = comfy.ldm.modules.attention.optimized_attention(query, k_neg, v_neg, heads=self.num_heads, transformer_options=transformer_options).flatten(2)
+    except TypeError:
+        x_pos = comfy.ldm.modules.attention.optimized_attention(query, k_pos, v_pos, heads=self.num_heads).flatten(2)
+        x_neg = comfy.ldm.modules.attention.optimized_attention(query, k_neg, v_neg, heads=self.num_heads).flatten(2)
+    guidance = x_pos * self.nag_scale - x_neg * (self.nag_scale - 1)
+    norm_pos = torch.norm(x_pos, p=1, dim=-1, keepdim=True).expand_as(x_pos)
+    norm_g   = torch.norm(guidance, p=1, dim=-1, keepdim=True).expand_as(guidance)
+    scale    = torch.nan_to_num(norm_g / norm_pos, nan=10.0)
+    mask     = scale > self.nag_tau
+    guidance = torch.where(mask, guidance * ((norm_pos * self.nag_tau) / (norm_g + 1e-7)), guidance)
+    return guidance * self.nag_alpha + x_pos * (1 - self.nag_alpha)
+
+
+def _wan_crossattn_nag(self, x, context, transformer_options={}, **kwargs):
+    if self.nag_input_type == "batch" or context.shape[0] == 1:
+        x_pos, ctx_pos = x, context
+        x_neg, ctx_neg = None, None
+    else:
+        x_pos, x_neg = torch.chunk(x, 2, dim=0)
+        ctx_pos, ctx_neg = torch.chunk(context, 2, dim=0)
+
+    q_pos = self.norm_q(self.q(x_pos))
+    nag_ctx = self.nag_context
+    if self.nag_input_type == "batch":
+        nag_ctx = nag_ctx.repeat(x_pos.shape[0], 1, 1)
+    try:
+        x_pos_out = _nag_core(self, q_pos, ctx_pos, nag_ctx, transformer_options=transformer_options)
+    except TypeError:
+        x_pos_out = _nag_core(self, q_pos, ctx_pos, nag_ctx)
+
+    if x_neg is not None:
+        q_neg = self.norm_q(self.q(x_neg))
+        k_neg = self.norm_k(self.k(ctx_neg))
+        v_neg = self.v(ctx_neg)
+        try:
+            x_neg_out = comfy.ldm.modules.attention.optimized_attention(q_neg, k_neg, v_neg, heads=self.num_heads, transformer_options=transformer_options)
+        except TypeError:
+            x_neg_out = comfy.ldm.modules.attention.optimized_attention(q_neg, k_neg, v_neg, heads=self.num_heads)
+        x = torch.cat([x_pos_out, x_neg_out], dim=0)
+    else:
+        x = x_pos_out
+    return self.o(x)
+
+
+def _wan_i2v_crossattn_nag(self, x, context, context_img_len, transformer_options={}, **kwargs):
+    ctx_img = context[:, :context_img_len]
+    context  = context[:, context_img_len:]
+
+    q_img = self.norm_q(self.q(x))
+    k_img = self.norm_k_img(self.k_img(ctx_img))
+    v_img = self.v_img(ctx_img)
+    try:
+        img_x = comfy.ldm.modules.attention.optimized_attention(q_img, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options)
+    except TypeError:
+        img_x = comfy.ldm.modules.attention.optimized_attention(q_img, k_img, v_img, heads=self.num_heads)
+
+    if context.shape[0] == 2:
+        x, x_neg = torch.chunk(x, 2, dim=0)
+        ctx_pos, ctx_neg = torch.chunk(context, 2, dim=0)
+    else:
+        ctx_pos, ctx_neg = context, None
+
+    q = self.norm_q(self.q(x))
+    try:
+        x = _nag_core(self, q, ctx_pos, self.nag_context, transformer_options=transformer_options)
+    except TypeError:
+        x = _nag_core(self, q, ctx_pos, self.nag_context)
+
+    if ctx_neg is not None:
+        q_rn = self.norm_q(self.q(x_neg))
+        k_rn = self.norm_k(self.k(ctx_neg))
+        v_rn = self.v(ctx_neg)
+        try:
+            x_neg = comfy.ldm.modules.attention.optimized_attention(q_rn, k_rn, v_rn, heads=self.num_heads, transformer_options=transformer_options)
+        except TypeError:
+            x_neg = comfy.ldm.modules.attention.optimized_attention(q_rn, k_rn, v_rn, heads=self.num_heads)
+        x = torch.cat([x, x_neg], dim=0)
+
+    return self.o(x + img_x)
+
+
+class _WanCrossAttentionPatch:
+    def __init__(self, context, nag_scale, nag_alpha, nag_tau, i2v, input_type):
+        self.nag_context = context
+        self.nag_scale   = nag_scale
+        self.nag_alpha   = nag_alpha
+        self.nag_tau     = nag_tau
+        self.i2v         = i2v
+        self.input_type  = input_type
+
+    def __get__(self, obj, objtype=None):
+        patch = self
+        def wrapped(self_module, *args, **kwargs):
+            self_module.nag_context  = patch.nag_context
+            self_module.nag_scale    = patch.nag_scale
+            self_module.nag_alpha    = patch.nag_alpha
+            self_module.nag_tau      = patch.nag_tau
+            self_module.nag_input_type = patch.input_type
+            if patch.i2v:
+                return _wan_i2v_crossattn_nag(self_module, *args, **kwargs)
+            return _wan_crossattn_nag(self_module, *args, **kwargs)
+        return types.MethodType(wrapped, obj)
+
+
+def _apply_nag(model, conditioning, nag_scale, nag_alpha, nag_tau, input_type="default"):
+    """Apply Normalized Attention Guidance to all Wan cross-attention blocks."""
+    if nag_scale == 0:
+        return model
+
+    device = comfy.model_management.get_torch_device()
+    dtype  = comfy.model_management.unet_dtype()
+
+    m = model.clone()
+    diff = m.get_model_object("diffusion_model")
+    diff.text_embedding.to(device)
+    context = diff.text_embedding(conditioning[0][0].to(device, dtype))
+
+    i2v = "WAN21_I2V" in str(type(model.model.model_config).__name__)
+
+    for idx, block in enumerate(diff.blocks):
+        patch = _WanCrossAttentionPatch(context, nag_scale, nag_alpha, nag_tau, i2v, input_type)
+        m.add_object_patch(f"diffusion_model.blocks.{idx}.cross_attn.forward",
+                           patch.__get__(block.cross_attn, block.__class__))
+    return m
+
+
 def _apply_loras(model, lora_stack):
     """Apply LoRA configs [(name, strength_model, strength_clip), ...] to a single model.
 
@@ -198,7 +385,8 @@ def _apply_loras(model, lora_stack):
         else:
             logger.info(f"    [LoRA cache] File hit: {lora_name}")
 
-        result, _ = comfy.sd.load_lora_for_models(result, None, _lora_file_cache[lora_path], strength_model, 0)
+        with _SuppressLoraKeyWarnings():
+            result, _ = comfy.sd.load_lora_for_models(result, None, _lora_file_cache[lora_path], strength_model, 0)
 
     # Store in patch cache, evict oldest if full
     if len(_patched_model_cache) >= _MAX_PATCH_CACHE:
@@ -229,13 +417,15 @@ def _apply_loras_dual(model_high, model_low, clip, lora_stack):
             lora_path = folder_paths.get_full_path_or_raise("loras", high_name)
             if lora_path not in _lora_file_cache:
                 _lora_file_cache[lora_path] = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            model_high, clip = comfy.sd.load_lora_for_models(model_high, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
+            with _SuppressLoraKeyWarnings():
+                model_high, clip = comfy.sd.load_lora_for_models(model_high, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
 
         if low_name is not None:
             lora_path = folder_paths.get_full_path_or_raise("loras", low_name)
             if lora_path not in _lora_file_cache:
                 _lora_file_cache[lora_path] = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            model_low, clip = comfy.sd.load_lora_for_models(model_low, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
+            with _SuppressLoraKeyWarnings():
+                model_low, clip = comfy.sd.load_lora_for_models(model_low, clip, _lora_file_cache[lora_path], strength_model, strength_clip)
 
     return model_high, model_low, clip
 
@@ -529,6 +719,18 @@ class WanLoopSampler:
             "optional": {
                 "i2v_mode": (I2V_MODES, {"default": "Painter I2V",
                                           "tooltip": "Painter I2V (default, original behavior): motion-enhanced latent + reference_latents. Regular I2V: stock WanImageToVideo conditioning (no motion scaling, no refs). Safe to leave unset on old workflows — defaults to Painter I2V."}),
+                # NAG — Normalized Attention Guidance
+                "nag_enable": ("BOOLEAN", {"default": False,
+                                           "tooltip": "Enable Normalized Attention Guidance (NAG). Strengthens prompt adherence without raising CFG. Pair with cfg_zero_star for best results."}),
+                "nag_scale": ("FLOAT", {"default": 11.0, "min": 0.0, "max": 100.0, "step": 0.001,
+                                        "tooltip": "NAG guidance strength (kempichi default: 11)"}),
+                "nag_alpha": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001,
+                                        "tooltip": "NAG mixing: balance between normalized guidance and original positive"}),
+                "nag_tau": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 10.0, "step": 0.001,
+                                      "tooltip": "NAG clipping threshold: max deviation of guided from positive attention"}),
+                # CFGZeroStar
+                "cfg_zero_star": ("BOOLEAN", {"default": False,
+                                              "tooltip": "Enable CFGZeroStar post-CFG correction. Improves alignment. Recommended alongside NAG."}),
                 "lora_stack": ("LORA_STACK", {"tooltip": "Base LoRAs applied to ALL segments"}),
                 "lora_stack_1": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 1 (on top of base)"}),
                 "lora_stack_2": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 2 (on top of base)"}),
@@ -556,6 +758,8 @@ class WanLoopSampler:
                  save_intermediates=False,
                  purge_vram=True,
                  i2v_mode="Painter I2V",
+                 nag_enable=False, nag_scale=11.0, nag_alpha=0.25, nag_tau=2.5,
+                 cfg_zero_star=False,
                  lora_stack=None,
                  lora_stack_1=None, lora_stack_2=None, lora_stack_3=None,
                  lora_stack_4=None, lora_stack_5=None):
@@ -579,6 +783,10 @@ class WanLoopSampler:
         print(f"  resolution={width}x{height}, length={length}, cfg={cfg}")
         print(f"  i2v_mode={i2v_mode}, shift={shift}, motion_amplitude={motion_amplitude}")
         print(f"  sampler={sampler_name}, scheduler={scheduler}")
+        if nag_enable:
+            print(f"  NAG: scale={nag_scale}, alpha={nag_alpha}, tau={nag_tau}")
+        if cfg_zero_star:
+            print(f"  CFGZeroStar: enabled")
         for j, seg in enumerate(segments):
             print(f"  Segment {j+1}: \"{seg[:100]}{'...' if len(seg)>100 else ''}\"")
         print(f"{'='*60}\n")
@@ -665,6 +873,10 @@ class WanLoopSampler:
                     if high_iter_loras:
                         m_high = _apply_loras(m_high, high_iter_loras)
                     m_high = _apply_shift(m_high, shift)
+                    if nag_enable:
+                        m_high = _apply_nag(m_high, high_pos, nag_scale, nag_alpha, nag_tau)
+                    if cfg_zero_star:
+                        m_high = _apply_cfg_zero_star(m_high)
 
                     latent = _run_ksampler(
                         m_high, iter_seed, total_steps, cfg, sampler_name, scheduler,
@@ -690,6 +902,10 @@ class WanLoopSampler:
                     if low_iter_loras:
                         m_low = _apply_loras(m_low, low_iter_loras)
                     m_low = _apply_shift(m_low, shift)
+                    if nag_enable:
+                        m_low = _apply_nag(m_low, low_pos, nag_scale, nag_alpha, nag_tau)
+                    if cfg_zero_star:
+                        m_low = _apply_cfg_zero_star(m_low)
 
                     latent = _run_ksampler(
                         m_low, iter_seed, total_steps, cfg, sampler_name, scheduler,
