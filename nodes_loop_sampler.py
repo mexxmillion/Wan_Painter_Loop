@@ -672,7 +672,7 @@ class WanLoopSampler:
     E.g. total_steps=7, split_step=3 → HIGH runs steps 0-2, LOW runs steps 3-6.
     """
 
-    MAX_SEGMENTS = 5
+    MAX_SEGMENTS = 6
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -737,6 +737,7 @@ class WanLoopSampler:
                 "lora_stack_3": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 3 (on top of base)"}),
                 "lora_stack_4": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 4 (on top of base)"}),
                 "lora_stack_5": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 5 (on top of base)"}),
+                "lora_stack_6": ("LORA_STACK", {"tooltip": "Extra LoRAs for segment 6 (on top of base)"}),
             },
         }
 
@@ -762,7 +763,7 @@ class WanLoopSampler:
                  cfg_zero_star=False,
                  lora_stack=None,
                  lora_stack_1=None, lora_stack_2=None, lora_stack_3=None,
-                 lora_stack_4=None, lora_stack_5=None):
+                 lora_stack_4=None, lora_stack_5=None, lora_stack_6=None):
 
         # --- Validate step split ---
         if split_step >= total_steps:
@@ -791,7 +792,14 @@ class WanLoopSampler:
             print(f"  Segment {j+1}: \"{seg[:100]}{'...' if len(seg)>100 else ''}\"")
         print(f"{'='*60}\n")
 
-        per_iter_stacks = [lora_stack_1, lora_stack_2, lora_stack_3, lora_stack_4, lora_stack_5]
+        per_iter_stacks = [
+            lora_stack_1,
+            lora_stack_2,
+            lora_stack_3,
+            lora_stack_4,
+            lora_stack_5,
+            lora_stack_6,
+        ]
 
         # --- Optionally purge VRAM before starting ---
         device = comfy.model_management.get_torch_device()

@@ -9,7 +9,7 @@ Multi-segment looping video generation for **Wan 2.2 Image-to-Video** models in 
 - **Multi-segment looping** — Split prompts with `---` to generate sequential video segments that chain seamlessly (last frame becomes the next segment's start image)
 - **Dual-model workflow** — HIGH-noise model handles initial denoising, LOW-noise model refines. Split point is configurable
 - **Two I2V modes** — *Painter I2V* (motion-enhanced latents + reference conditioning) or *Regular I2V* (stock WanImageToVideo)
-- **Per-segment LoRAs** — Apply base LoRAs to all segments plus unique LoRAs per segment (up to 5 segments)
+- **Per-segment LoRAs** — Apply base LoRAs to all segments plus unique LoRAs per segment (up to 6 segments)
 - **Two-level LoRA cache** — File cache + patch cache eliminates redundant disk I/O and model patching across runs
 - **Advanced guidance** — Optional NAG (Normalized Attention Guidance) and CFGZeroStar post-CFG correction
 - **VRAM management** — Optional purge between passes/segments for 24GB GPUs; disable on 48GB+ for speed
@@ -72,7 +72,7 @@ The main node. Orchestrates multi-segment video generation.
 | `nag_tau` | NAG clipping threshold (default: 2.5) |
 | `cfg_zero_star` | Enable CFGZeroStar correction (pairs well with NAG) |
 | `lora_stack` | Base LoRAs applied to ALL segments |
-| `lora_stack_1`–`5` | Per-segment LoRAs (on top of base) |
+| `lora_stack_1`–`6` | Per-segment LoRAs (on top of base) |
 
 **Outputs:** `images` (all frames concatenated), `last_frame`, `frame_count`
 
